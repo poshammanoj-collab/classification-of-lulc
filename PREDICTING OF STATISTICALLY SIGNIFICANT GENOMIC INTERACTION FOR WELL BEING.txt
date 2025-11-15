@@ -1,0 +1,347 @@
+import os
+import glob
+import argparse
+import math
+import random
+import numpy as np
+import rasterio
+import cv2
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+
+# Optional: augmentation if albumentations installed
+try:
+    import albumentations as A
+    AUG_AVAILABLE = True
+except Exception:
+    AUG_AVAILABLE = False
+
+# -------------------------
+# Utility: read single-band raster file
+# -------------------------
+def read_band(path):
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype(np.float32)
+    return arr
+
+# -------------------------
+# Build 4-channel image (B02,B03,B04,B08)
+# Expects file paths - supports .jp2 or .tif
+# -------------------------
+def build_4band_image(b02_path, b03_path, b04_path, b08_path):
+    b2 = read_band(b02_path)
+    b3 = read_band(b03_path)
+    b4 = read_band(b04_path)
+    b8 = read_band(b08_path)
+
+    # Clip extreme outliers and normalize per-image to [0,1]
+    stack = np.stack([b2, b3, b4, b8], axis=-1)
+    # small epsilon to avoid divide by zero
+    mn, mx = stack.min(), stack.max()
+    if mx - mn > 1e-6:
+        stack = (stack - mn) / (mx - mn)
+    else:
+        stack = np.zeros_like(stack)
+    return stack
+
+# -------------------------
+# NDVI mask (vegetation) and NDBI mask (proxy for built-up)
+# NDVI = (NIR - RED) / (NIR + RED)
+# NDBI = (SWIR - NIR) / (SWIR + NIR) -- if SWIR not available use NIR vs GREEN fallback
+# -------------------------
+def compute_ndvi_mask(img, ndvi_thresh=0.3):
+    # img: H x W x 4 (B,G,R,NIR)
+    red = img[:,:,2]
+    nir = img[:,:,3]
+    ndvi = (nir - red) / (nir + red + 1e-10)
+    mask = (ndvi > ndvi_thresh).astype(np.uint8)
+    return mask, ndvi
+
+def compute_ndbi_mask(img, ndbi_thresh=0.2):
+    # no SWIR band available in our 4-band composite; use NIR - GREEN fallback
+    nir = img[:,:,3]
+    green = img[:,:,1]
+    ndbi = (nir - green) / (nir + green + 1e-10)
+    mask = (ndbi > ndbi_thresh).astype(np.uint8)
+    return mask, ndbi
+
+# -------------------------
+# Tiling / patch generation
+# - sliding with stride default == patch_size (no overlap)
+# - optionally drop patches with too little labeled pixels
+# -------------------------
+def image_to_patches(img, mask, patch_size=256, stride=None, min_mask_coverage=0.0):
+    if stride is None:
+        stride = patch_size
+    H, W = img.shape[:2]
+    patches_img = []
+    patches_mask = []
+    for y in range(0, H - patch_size + 1, stride):
+        for x in range(0, W - patch_size + 1, stride):
+            p_img = img[y:y+patch_size, x:x+patch_size]
+            p_mask = mask[y:y+patch_size, x:x+patch_size]
+            coverage = p_mask.mean()
+            if coverage >= min_mask_coverage:
+                patches_img.append(p_img)
+                patches_mask.append(p_mask[..., np.newaxis])
+    return np.array(patches_img, dtype=np.float32), np.array(patches_mask, dtype=np.float32)
+
+# -------------------------
+# Data loader: find band files in input directory
+# Expects each scene in subfolder with filenames containing B02, B03, B04, B08 (or user can pass explicit paths)
+# -------------------------
+def discover_scenes(input_dir):
+    scenes = []
+    # If input_dir contains per-scene subfolders
+    for sub in sorted(glob.glob(os.path.join(input_dir,'*'))):
+        if os.path.isdir(sub):
+            b02 = glob.glob(os.path.join(sub, '*B02*.jp2')) + glob.glob(os.path.join(sub, '*B02*.tif')) + glob.glob(os.path.join(sub, '*B02*.*'))
+            b03 = glob.glob(os.path.join(sub, '*B03*.jp2')) + glob.glob(os.path.join(sub, '*B03*.tif')) + glob.glob(os.path.join(sub, '*B03*.*'))
+            b04 = glob.glob(os.path.join(sub, '*B04*.jp2')) + glob.glob(os.path.join(sub, '*B04*.tif')) + glob.glob(os.path.join(sub, '*B04*.*'))
+            b08 = glob.glob(os.path.join(sub, '*B08*.jp2')) + glob.glob(os.path.join(sub, '*B08*.tif')) + glob.glob(os.path.join(sub, '*B08*.*'))
+            if b02 and b03 and b04 and b08:
+                scenes.append((b02[0], b03[0], b04[0], b08[0]))
+    # Also check if input_dir itself contains the four bands (single scene)
+    b02 = glob.glob(os.path.join(input_dir, '*B02*.jp2')) + glob.glob(os.path.join(input_dir, '*B02*.tif'))
+    b03 = glob.glob(os.path.join(input_dir, '*B03*.jp2')) + glob.glob(os.path.join(input_dir, '*B03*.tif'))
+    b04 = glob.glob(os.path.join(input_dir, '*B04*.jp2')) + glob.glob(os.path.join(input_dir, '*B04*.tif'))
+    b08 = glob.glob(os.path.join(input_dir, '*B08*.jp2')) + glob.glob(os.path.join(input_dir, '*B08*.tif'))
+    if b02 and b03 and b04 and b08:
+        scenes.append((b02[0], b03[0], b04[0], b08[0]))
+    return scenes
+
+# -------------------------
+# U-Net model builder
+# -------------------------
+def build_unet(input_shape=(256,256,4), base_filters=32):
+    inputs = layers.Input(shape=input_shape)
+
+    # encoder
+    c1 = layers.Conv2D(base_filters, 3, activation='relu', padding='same')(inputs)
+    c1 = layers.Conv2D(base_filters, 3, activation='relu', padding='same')(c1)
+    p1 = layers.MaxPooling2D()(c1)
+
+    c2 = layers.Conv2D(base_filters*2, 3, activation='relu', padding='same')(p1)
+    c2 = layers.Conv2D(base_filters*2, 3, activation='relu', padding='same')(c2)
+    p2 = layers.MaxPooling2D()(c2)
+
+    c3 = layers.Conv2D(base_filters*4, 3, activation='relu', padding='same')(p2)
+    c3 = layers.Conv2D(base_filters*4, 3, activation='relu', padding='same')(c3)
+    p3 = layers.MaxPooling2D()(c3)
+
+    # bottleneck
+    b = layers.Conv2D(base_filters*8, 3, activation='relu', padding='same')(p3)
+    b = layers.Conv2D(base_filters*8, 3, activation='relu', padding='same')(b)
+
+    # decoder
+    u3 = layers.UpSampling2D()(b)
+    u3 = layers.Concatenate()([u3, c3])
+    c4 = layers.Conv2D(base_filters*4, 3, activation='relu', padding='same')(u3)
+    c4 = layers.Conv2D(base_filters*4, 3, activation='relu', padding='same')(c4)
+
+    u2 = layers.UpSampling2D()(c4)
+    u2 = layers.Concatenate()([u2, c2])
+    c5 = layers.Conv2D(base_filters*2, 3, activation='relu', padding='same')(u2)
+    c5 = layers.Conv2D(base_filters*2, 3, activation='relu', padding='same')(c5)
+
+    u1 = layers.UpSampling2D()(c5)
+    u1 = layers.Concatenate()([u1, c1])
+    c6 = layers.Conv2D(base_filters, 3, activation='relu', padding='same')(u1)
+    c6 = layers.Conv2D(base_filters, 3, activation='relu', padding='same')(c6)
+
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(c6)
+
+    model = Model(inputs, outputs)
+    return model
+
+# -------------------------
+# IoU metric
+# -------------------------
+def iou_metric(y_true, y_pred, threshold=0.5, eps=1e-7):
+    y_pred_f = (y_pred >= threshold).astype(np.float32)
+    y_true_f = y_true.astype(np.float32)
+    inter = (y_true_f * y_pred_f).sum(axis=(1,2,3))
+    union = y_true_f.sum(axis=(1,2,3)) + y_pred_f.sum(axis=(1,2,3)) - inter
+    iou = (inter + eps) / (union + eps)
+    return iou.mean()
+
+# -------------------------
+# Data augmentation wrapper (albumentations)
+# -------------------------
+def augment_patch(img, mask):
+    if not AUG_AVAILABLE:
+        return img, mask
+    aug = A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=30, p=0.5),
+    ])
+    augmented = aug(image=(img*255).astype(np.uint8), mask=(mask.squeeze()*255).astype(np.uint8))
+    img2 = augmented['image'].astype(np.float32) / 255.0
+    mask2 = (augmented['mask'].astype(np.uint8) > 127).astype(np.uint8)[..., np.newaxis]
+    return img2, mask2
+
+# -------------------------
+# Training pipeline
+# -------------------------
+def train_pipeline(input_dir, out_dir,
+                   patch_size=256, stride=None,
+                   ndvi_thresh=0.3, ndbi_thresh=0.2,
+                   epochs=30, batch_size=8, val_split=0.2,
+                   min_mask_coverage=0.0):
+    os.makedirs(out_dir, exist_ok=True)
+
+    scenes = discover_scenes(input_dir)
+    if len(scenes) == 0:
+        raise RuntimeError(f"No sentinel scenes found in {input_dir}. Put band files (B02/B03/B04/B08) in subfolders or in root.")
+
+    print(f"Discovered {len(scenes)} scene(s). Building patches...")
+
+    all_X = []
+    all_Y = []
+
+    for (b02,b03,b04,b08) in scenes:
+        print("Loading scene:", os.path.basename(b02))
+        img = build_4band_image(b02, b03, b04, b08)  # normalized 0..1
+        veg_mask, ndvi = compute_ndvi_mask(img, ndvi_thresh)
+        bld_mask, ndbi = compute_ndbi_mask(img, ndbi_thresh)
+
+        # choose which mask to train on
+        # For vegetation: use veg_mask
+        # For buildings: use bld_mask
+        # For demo we let user choose later. Here default is vegetation
+        chosen_mask = veg_mask  # change to bld_mask if you want buildings
+
+        Xp, Yp = image_to_patches(img, chosen_mask, patch_size, stride, min_mask_coverage)
+        print(f"  -> patches from scene: {len(Xp)}")
+        if len(Xp) == 0:
+            continue
+        all_X.append(Xp)
+        all_Y.append(Yp)
+
+    if len(all_X) == 0:
+        raise RuntimeError("No patches produced. Try reducing min_mask_coverage or check input images.")
+
+    X = np.concatenate(all_X, axis=0)
+    Y = np.concatenate(all_Y, axis=0)
+    print("Total patches:", X.shape[0])
+
+    # Shuffle & split
+    idx = np.arange(len(X))
+    np.random.shuffle(idx)
+    X = X[idx]
+    Y = Y[idx]
+
+    X_train, X_val, y_train, y_val = train_test_split(X, Y, test_size=val_split, random_state=42)
+    print("Train:", X_train.shape[0], "Val:", X_val.shape[0])
+
+    # Build model
+    model = build_unet(input_shape=(patch_size, patch_size, X.shape[-1]), base_filters=32)
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+    # Callbacks
+    ckpt_path = os.path.join(out_dir, "unet_best.h5")
+    checkpoint = ModelCheckpoint(ckpt_path, monitor='val_loss', save_best_only=True, verbose=1)
+    earlystop = EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True, verbose=1)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, verbose=1)
+
+    # Simple data generator with optional augmentation
+    def data_generator(Xarr, Yarr, batch_size, augment=False):
+        n = len(Xarr)
+        while True:
+            idxs = np.random.permutation(n)
+            for i in range(0, n, batch_size):
+                batch_idx = idxs[i:i+batch_size]
+                bx = []
+                by = []
+                for j in batch_idx:
+                    imgp = Xarr[j]
+                    maskp = Yarr[j]
+                    if augment and AUG_AVAILABLE and random.random() < 0.7:
+                        imgp2, maskp2 = augment_patch(imgp, maskp)
+                    else:
+                        imgp2, maskp2 = imgp, maskp
+                    bx.append(imgp2)
+                    by.append(maskp2)
+                yield np.array(bx, dtype=np.float32), np.array(by, dtype=np.float32)
+
+    train_steps = max(1, len(X_train) // batch_size)
+    val_steps = max(1, len(X_val) // batch_size)
+
+    history = model.fit(
+        data_generator(X_train, y_train, batch_size, augment=True),
+        steps_per_epoch=train_steps,
+        validation_data=data_generator(X_val, y_val, batch_size, augment=False),
+        validation_steps=val_steps,
+        epochs=epochs,
+        callbacks=[checkpoint, earlystop, reduce_lr],
+        verbose=1
+    )
+
+    # Save final model and history
+    model.save(os.path.join(out_dir, "unet_final.h5"))
+    print("Model saved to", out_dir)
+
+    # Evaluate IoU on validation set (per-patch)
+    y_pred = model.predict(X_val, batch_size=8)
+    iou_val = iou_metric(y_val, y_pred, threshold=0.5)
+    print(f"Validation IoU (threshold=0.5): {iou_val:.4f}")
+
+    # Show example predictions
+    n_show = min(6, len(X_val))
+    fig, axes = plt.subplots(n_show, 3, figsize=(12, 4*n_show))
+    for i in range(n_show):
+        imgv = X_val[i][:,:,:3]
+        gt = y_val[i].squeeze()
+        pr = (y_pred[i].squeeze() >= 0.5).astype(np.uint8)
+        axes[i,0].imshow(imgv)
+        axes[i,0].set_title("Input (RGB)")
+        axes[i,1].imshow(gt, cmap='gray')
+        axes[i,1].set_title("Ground Truth")
+        axes[i,2].imshow(pr, cmap='gray')
+        axes[i,2].set_title("Predicted")
+        for ax in axes[i]:
+            ax.axis('off')
+    plt.tight_layout()
+    sample_fig = os.path.join(out_dir, "sample_predictions.png")
+    plt.savefig(sample_fig, dpi=200)
+    print("Saved sample predictions to", sample_fig)
+    plt.close(fig)
+
+    return model, history
+
+# -------------------------
+# CLI
+# -------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="LULC U-Net pipeline (single-file).")
+    p.add_argument("--input-dir", required=True, help="Directory containing sentinel bands (either subfolders per-scene or all band files).")
+    p.add_argument("--out", required=True, help="Output directory to save model and results.")
+    p.add_argument("--patch-size", type=int, default=256)
+    p.add_argument("--stride", type=int, default=None, help="Patch stride. Default equals patch-size (no overlap).")
+    p.add_argument("--ndvi-thresh", type=float, default=0.3)
+    p.add_argument("--ndbi-thresh", type=float, default=0.2)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--min-mask-coverage", type=float, default=0.0, help="Min fraction of positive pixels in a patch to keep it.")
+    return p.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    print("Albumentations available:", AUG_AVAILABLE)
+    model, history = train_pipeline(
+        input_dir=args.input_dir,
+        out_dir=args.out,
+        patch_size=args.patch_size,
+        stride=args.stride,
+        ndvi_thresh=args.ndvi_thresh,
+        ndbi_thresh=args.ndbi_thresh,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        min_mask_coverage=args.min_mask_coverage
+    )
+    print("Done.")
